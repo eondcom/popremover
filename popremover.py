@@ -230,10 +230,16 @@ def _is_safe_delete_dir(d):
 
 
 def _dir_size_kb(path):
-    """디렉터리 크기(KB). 실패 시 빈 문자열."""
-    if not path or not os.path.isdir(path):
+    """디렉터리 크기(KB). 심볼릭 링크는 실제 대상을 따라가 계산. 실패 시 "".
+
+    (예: /opt/idea -> /opt/idea-2026.1.2 인 경우 링크가 아니라 대상 크기를 잼)
+    """
+    if not path:
         return ""
-    rc, out, _ = run(["du", "-sk", path])
+    real = os.path.realpath(path)
+    if not os.path.isdir(real):
+        return ""
+    rc, out, _ = run(["du", "-sk", real])
     if rc == 0 and out:
         try:
             return out.split()[0]
@@ -299,18 +305,26 @@ def list_desktop_apps():
         name = ent.get("Name") or os.path.splitext(os.path.basename(path))[0]
         install_dir = _derive_install_dir(binpath)
         is_jb = "jetbrains" in (path + binpath).lower() or "/idea" in binpath.lower()
-        summary = ent.get("Comment", "")
+        comment = ent.get("Comment", "")
+        is_link = bool(install_dir) and os.path.islink(install_dir)
+        link_target = os.path.realpath(install_dir) if is_link else ""
         loc = install_dir or binpath
+        if is_link:
+            loc_label = f"{install_dir} → {link_target} (심볼릭 링크)"
+        else:
+            loc_label = loc
         apps.append({
             "name": name,
             "version": "",
             "size_kb": "",       # 나중에 du로 채움
-            "summary": f"{loc}  —  {summary}".strip(" —"),
+            "summary": f"{loc_label}  —  {comment}".strip(" —"),
             "kind": "desktop",
             "manual": True,
             "desktop_file": path,
             "bin": binpath,
             "install_dir": install_dir,
+            "is_symlink": is_link,
+            "link_target": link_target,
             "is_jetbrains": is_jb,
             "location": loc,
         })
@@ -726,7 +740,12 @@ class PopRemover(Gtk.Window):
                 lines.append(f"    런처: {dfile}")
                 targets.append(dfile)
             idir = d.get("install_dir", "")
-            if idir and _is_safe_delete_dir(idir):
+            if idir and d.get("is_symlink"):
+                # 심볼릭 링크는 링크만 삭제 → 실제 설치는 그대로 둔다
+                lines.append(f"    링크: {idir} → {d.get('link_target')}")
+                lines.append("          (링크만 삭제, 실제 설치 폴더는 보존)")
+                targets.append(idir)
+            elif idir and _is_safe_delete_dir(idir):
                 sz = human_size(d.get("size_kb")) or "?"
                 lines.append(f"    폴더: {idir}  ({sz})")
                 targets.append(idir)
