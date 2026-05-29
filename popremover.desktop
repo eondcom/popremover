@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PopRemover
+Name[ko]=프로그램 제거
+Comment=Uninstall installed apt packages and flatpak apps
+Comment[ko]=설치된 apt 패키지와 flatpak 앱을 제거합니다
+Exec=@BIN@
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;
+Keywords=uninstall;remove;package;apt;flatpak;제거;삭제;
