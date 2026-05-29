@@ -180,11 +180,36 @@ def _derive_install_dir(binpath):
         root = binpath.split("/bin/")[0]
         if root in _SHARED_BIN_PARENTS:   # 예: /home/dell/.local/bin/x → /home/dell/.local
             return ""
-        return root
+        return _collapse_wrapper_dir(root)
     parent = os.path.dirname(binpath)
     if parent in _SHARED_BIN_DIRS:        # 예: /usr/bin/x
         return ""
-    return parent
+    return _collapse_wrapper_dir(parent)
+
+
+def _collapse_wrapper_dir(d):
+    """압축 해제 시 생긴 이중 래퍼 폴더를 위로 접어 올림.
+
+    예) ~/Downloads/foo/foo/bin/x → 설치루트가 ~/Downloads/foo/foo 로 잡히지만
+        상위 ~/Downloads/foo 가 이 폴더 하나만 담고 있으면(=래퍼) 거기까지 삭제.
+        단 안전 경로일 때만 올라가고, ~/Downloads 같은 공용 상위에서 멈춤.
+    """
+    if not d or not d.startswith("/"):
+        return d
+    for _ in range(8):  # 무한루프 방지
+        parent = os.path.dirname(d)
+        if not _is_safe_delete_dir(parent):
+            break
+        try:
+            entries = os.listdir(parent)
+        except OSError:
+            break
+        # 상위가 '이 폴더 하나'만 담고 있을 때만 래퍼로 보고 올라감
+        if entries == [os.path.basename(d)]:
+            d = parent
+        else:
+            break
+    return d
 
 
 def _is_safe_delete_dir(d):
