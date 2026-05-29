@@ -248,6 +248,36 @@ def _dir_size_kb(path):
     return ""
 
 
+def _pids_using(paths):
+    """주어진 디렉터리/경로 아래의 실행파일로 동작 중인 프로세스 PID 목록.
+
+    /proc/<pid>/exe 를 읽어 install_dir 하위인지 검사. 삭제된 실행파일도
+    ' (deleted)' 표시를 떼고 비교하므로 '삭제됐지만 아직 실행 중'도 잡힌다.
+    """
+    bases = [p.rstrip("/") for p in paths if p and p.startswith("/")]
+    if not bases:
+        return []
+    pids = []
+    try:
+        proc_entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for pid in proc_entries:
+        if not pid.isdigit():
+            continue
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            continue
+        if exe.endswith(" (deleted)"):
+            exe = exe[: -len(" (deleted)")]
+        for base in bases:
+            if exe == base or exe.startswith(base + "/"):
+                pids.append(int(pid))
+                break
+    return pids
+
+
 def list_desktop_apps():
     """apt·flatpak이 관리하지 않는, .desktop으로 등록된 수동 설치 앱.
 
@@ -292,7 +322,7 @@ def list_desktop_apps():
             if ": " in line:
                 owned.add(line.rsplit(": ", 1)[1].strip())
 
-    apps = []
+    raw = []
     for ent in entries:
         path = ent["_path"]
         binpath = ent.get("_bin", "")
@@ -304,29 +334,68 @@ def list_desktop_apps():
             continue
         name = ent.get("Name") or os.path.splitext(os.path.basename(path))[0]
         install_dir = _derive_install_dir(binpath)
-        is_jb = "jetbrains" in (path + binpath).lower() or "/idea" in binpath.lower()
-        comment = ent.get("Comment", "")
         is_link = bool(install_dir) and os.path.islink(install_dir)
-        link_target = os.path.realpath(install_dir) if is_link else ""
-        loc = install_dir or binpath
-        if is_link:
-            loc_label = f"{install_dir} → {link_target} (심볼릭 링크)"
-        else:
-            loc_label = loc
-        apps.append({
+        raw.append({
             "name": name,
-            "version": "",
-            "size_kb": "",       # 나중에 du로 채움
-            "summary": f"{loc_label}  —  {comment}".strip(" —"),
-            "kind": "desktop",
-            "manual": True,
+            "comment": ent.get("Comment", ""),
             "desktop_file": path,
             "bin": binpath,
             "install_dir": install_dir,
+            "real_dir": os.path.realpath(install_dir) if install_dir else "",
             "is_symlink": is_link,
-            "link_target": link_target,
-            "is_jetbrains": is_jb,
-            "location": loc,
+            "is_jetbrains": "jetbrains" in (path + binpath).lower()
+                            or "/idea" in binpath.lower(),
+        })
+
+    # 같은 실제 경로(realpath)를 가리키는 항목들을 하나로 합침
+    # (예: /opt/idea(심볼릭) 와 /opt/idea-2026.1.2(실제) → 한 줄)
+    groups = {}   # 그룹 키 → 해당 raw 항목 리스트
+    order = []
+    for r in raw:
+        key = r["real_dir"] if r["real_dir"] else "nodir::" + r["desktop_file"]
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    apps = []
+    for key in order:
+        members = groups[key]
+        # 표시 대표: 실제 폴더(심볼릭 아님)를 가진 항목을 우선
+        primary = next((m for m in members if not m["is_symlink"]), members[0])
+        real_dir = primary["real_dir"]
+        desktop_files = [m["desktop_file"] for m in members]
+        # 삭제할 심볼릭 링크(실제 폴더와 별개로 링크만 제거)
+        symlinks = sorted({m["install_dir"] for m in members
+                           if m["is_symlink"] and m["install_dir"] != real_dir})
+        names = [m["name"] for m in members]
+        aliases = [n for n in names if n != primary["name"]]
+
+        loc_label = real_dir or primary["bin"]
+        extra = []
+        if symlinks:
+            extra.append("링크: " + ", ".join(symlinks))
+        if len(desktop_files) > 1:
+            extra.append(f"런처 {len(desktop_files)}개")
+        if aliases:
+            extra.append("별칭: " + ", ".join(aliases))
+        summary = loc_label
+        if primary["comment"]:
+            summary += "  —  " + primary["comment"]
+        if extra:
+            summary += "   [" + " · ".join(extra) + "]"
+
+        apps.append({
+            "name": primary["name"],
+            "version": "",
+            "size_kb": "",          # 나중에 du로 채움
+            "summary": summary,
+            "kind": "desktop",
+            "manual": True,
+            "desktop_files": desktop_files,
+            "symlinks": symlinks,
+            "install_dir": real_dir,   # 크기 계산·표시·삭제 대상(실제 폴더)
+            "is_jetbrains": any(m["is_jetbrains"] for m in members),
         })
     return apps
 
@@ -490,6 +559,13 @@ class PopRemover(Gtk.Window):
         self.autoremove = Gtk.CheckButton(label="불필요한 의존성도 정리")
         self.autoremove.set_active(True)
         opts.pack_start(self.autoremove, False, False, 0)
+
+        self.protect_running = Gtk.CheckButton(label="실행 중인 앱은 보호")
+        self.protect_running.set_active(True)
+        self.protect_running.set_tooltip_text(
+            "지금 실행 중인 프로그램은 제거를 막습니다.\n"
+            "(실행 중에 지우면 다시 켤 수 없게 됩니다.)")
+        opts.pack_start(self.protect_running, False, False, 0)
 
         self.count_label = Gtk.Label(label="", xalign=1)
         self.count_label.get_style_context().add_class("dim-label")
@@ -728,6 +804,26 @@ class PopRemover(Gtk.Window):
             self._info("선택된 앱이 없습니다.")
             return
 
+        # 실행 중인 앱 보호: 지금 동작 중인 프로그램은 제거 대상에서 제외
+        if self.protect_running.get_active():
+            running = []
+            keep = []
+            for d in items:
+                check = [d.get("install_dir", "")] + d.get("symlinks", [])
+                if _pids_using(check):
+                    running.append(d["name"])
+                else:
+                    keep.append(d)
+            if running:
+                note = ("실행 중이라 보호된 앱(제거하지 않음):\n\n  • "
+                        + "\n  • ".join(running)
+                        + "\n\n먼저 해당 앱을 완전히 종료한 뒤 다시 시도하세요.\n"
+                        "(꼭 실행 중에 지우려면 상단 '실행 중인 앱은 보호'를 끄세요.)")
+                self._info(note)
+            items = keep
+            if not items:
+                return
+
         targets = []          # 실제로 삭제할 경로
         lines = []            # 확인창에 보여줄 설명
         unsafe = []           # 설치 폴더 자동삭제가 위험해 건너뛴 항목
@@ -735,17 +831,14 @@ class PopRemover(Gtk.Window):
 
         for d in items:
             lines.append(f"▸ {d['name']}")
-            dfile = d.get("desktop_file")
-            if dfile:
+            for dfile in d.get("desktop_files", []):
                 lines.append(f"    런처: {dfile}")
                 targets.append(dfile)
+            for link in d.get("symlinks", []):
+                lines.append(f"    링크: {link}  (링크만 삭제)")
+                targets.append(link)
             idir = d.get("install_dir", "")
-            if idir and d.get("is_symlink"):
-                # 심볼릭 링크는 링크만 삭제 → 실제 설치는 그대로 둔다
-                lines.append(f"    링크: {idir} → {d.get('link_target')}")
-                lines.append("          (링크만 삭제, 실제 설치 폴더는 보존)")
-                targets.append(idir)
-            elif idir and _is_safe_delete_dir(idir):
+            if idir and _is_safe_delete_dir(idir):
                 sz = human_size(d.get("size_kb")) or "?"
                 lines.append(f"    폴더: {idir}  ({sz})")
                 targets.append(idir)
